@@ -12,7 +12,8 @@ import datetime
 # -------------------------------------------------------------
 SCHEDULE_FILE = "schedule_data.json"
 LEAVE_FILE = "leave_data.json"
-CALENDAR_FILE = "calendar_schedule.json"
+MEMO_FILE = "memo_data.json"
+WATCHLIST_FILE = "watchlist_data.json"
 
 def load_data(file_path):
     if os.path.exists(file_path):
@@ -130,6 +131,15 @@ st.markdown("""
         font-size: 12px;
         border: 1px solid #fecdd3;
     }
+    .stock-down {
+        font-weight: 700;
+        color: #0284c7;
+        background: #e0f2fe;
+        padding: 2px 8px;
+        border-radius: 20px;
+        font-size: 12px;
+        border: 1px solid #bae6fd;
+    }
     .weather-box {
         display: flex;
         flex-direction: column;
@@ -144,9 +154,57 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -------------------------------------------------------------
-# 3. 데이터 수집 로직 (캐싱 적용)
+# 3. 데이터 수집 로직 및 한글 종목 자동 변환 함수
 # -------------------------------------------------------------
 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+def resolve_ticker(query):
+    query_clean = query.strip()
+    if not query_clean:
+        return ""
+    
+    known_kr_stocks = {
+        "현대힘스": "460930.KQ",
+        "삼성전자": "005930.KS",
+        "SK하이닉스": "000660.KS",
+        "LG에너지솔루션": "373220.KS",
+        "삼성바이오로직스": "207940.KS",
+        "현대차": "005380.KS",
+        "셀트리온": "068270.KS",
+        "기아": "000270.KS",
+        "NAVER": "035420.KS",
+        "카카오": "035720.KS"
+    }
+    
+    if query_clean in known_kr_stocks:
+        return known_kr_stocks[query_clean]
+
+    if query_clean.isdigit() and len(query_clean) == 6:
+        return query_clean + ".KS"
+
+    if any(c.isascii() for c in query_clean) and not any(ord(c) > 128 for c in query_clean):
+        return query_clean.upper()
+
+    try:
+        search_url = f"https://finance.naver.com/search/searchList.naver?query={query_clean}"
+        res = requests.get(search_url, headers=headers, timeout=3)
+        res.encoding = 'euc-kr'
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        item_tag = soup.select_one("table.tbl_list tr td.tic a") or soup.select_one("a.tltle")
+        if item_tag and item_tag.has_attr('href'):
+            href = item_tag['href']
+            if "code=" in href:
+                code = href.split("code=")[1].split("&")[0]
+                market_type = ".KS"
+                row = item_tag.find_parent("tr")
+                if row and ("코스닥" in row.get_text() or "KOSDAQ" in row.get_text()):
+                    market_type = ".KQ"
+                return code + market_type
+    except Exception:
+        pass
+    
+    return query_clean.upper()
 
 @st.cache_data(ttl=600)
 def fetch_weather():
@@ -296,9 +354,23 @@ with col1:
         st.markdown(news_html, unsafe_allow_html=True)
 
 # =============================================================
-# [2열] 환율 및 증시 영역
+# [2열] 환율, 증시 및 관심 종목 영역
 # =============================================================
 with col2:
+    if "watchlist" not in st.session_state:
+        st.session_state.watchlist = load_data(WATCHLIST_FILE)
+
+    if "del_watch" in st.query_params:
+        try:
+            del_idx = int(st.query_params["del_watch"])
+            if 0 <= del_idx < len(st.session_state.watchlist):
+                st.session_state.watchlist.pop(del_idx)
+                save_data(WATCHLIST_FILE, st.session_state.watchlist)
+        except Exception:
+            pass
+        st.query_params.clear()
+        st.rerun()
+
     ex_html = '<div class="ocean-card"><h3 style="color:#0d9488 !important; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">💱 실시간 주요 환율</h3>'
     for ex in exchange_rates:
         ex_html += f"""
@@ -339,44 +411,88 @@ with col2:
     us_html += '</div>'
     st.markdown(us_html, unsafe_allow_html=True)
 
+    # 🔍 내 관심 종목 검색 및 등록 카드
+    st.markdown('<div class="ocean-card"><h3 style="color: #0284c7; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">⭐ 내 관심 종목 검색 및 등록</h3>', unsafe_allow_html=True)
+    
+    new_ticker = st.text_input("종목명 또는 티커 입력", placeholder="예: 현대힘스, 삼성전자, 460930, AAPL 등", key="watch_input")
+    if st.button("관심 종목 추가", key="btn_add_watch", use_container_width=True):
+        if new_ticker.strip():
+            resolved = resolve_ticker(new_ticker)
+            if resolved and resolved not in st.session_state.watchlist:
+                st.session_state.watchlist.append(resolved)
+                save_data(WATCHLIST_FILE, st.session_state.watchlist)
+                st.rerun()
+
+    st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
+
+    watch_html = ""
+    if not st.session_state.watchlist:
+        watch_html = '<div style="font-size:13px; color:#64748b; text-align: center; padding: 10px;">등록된 관심 종목이 없습니다.</div>'
+    else:
+        for idx, sym in enumerate(st.session_state.watchlist):
+            try:
+                t_obj = yf.Ticker(sym)
+                info = t_obj.fast_info
+                price = info['lastPrice']
+                prev = info['previousClose']
+                pct = ((price - prev) / prev) * 100
+                rate_str = f"+{pct:.2f}%" if pct > 0 else f"{pct:.2f}%"
+                badge_class = "stock-up" if pct >= 0 else "stock-down"
+                price_str = f"{price:,.2f}" if price > 100 else f"{price:,.4f}"
+                link_url = f"https://finance.yahoo.com/quote/{sym}"
+            except Exception:
+                price_str = "조회 실패 (코드 확인 필요)"
+                rate_str = "-"
+                badge_class = "stock-down"
+                link_url = "#"
+
+            watch_html += f'<div style="display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid #f1f5f9;"><a href="{link_url}" target="_blank" style="text-decoration:none;"><span style="font-size: 13px; color: #0f172a; font-weight: 700;">{sym}</span> <span style="font-size: 13px; color: #0369a1; font-weight: 600; margin-left:8px;">{price_str}</span></a><div style="display:flex; align-items:center; gap:8px;"><span class="{badge_class}">{rate_str}</span><a href="?del_watch={idx}" target="_self" style="background: #fee2e2; color: #ef4444; border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: bold; text-decoration: none; border: 1px solid #fca5a5;">✕</a></div></div>'
+
+    st.markdown(f'<div style="background: #ffffff; border-radius: 12px; border: 1px solid #cbd5e1; padding: 4px 12px; max-height: 250px; overflow-y: auto;">{watch_html}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 # =============================================================
-# [3열] 스케줄 및 연차 기간 지정 관리 영역
+# [3열] 스케줄, 연차 및 메모 관리 영역
 # =============================================================
 with col3:
     if "schedule_list" not in st.session_state:
         st.session_state.schedule_list = load_data(SCHEDULE_FILE)
     if "leave_list" not in st.session_state:
         st.session_state.leave_list = load_data(LEAVE_FILE)
+    if "memo_content" not in st.session_state:
+        saved_memo = load_data(MEMO_FILE)
+        st.session_state.memo_content = saved_memo[0] if saved_memo else ""
 
-    # 🔗 삭제 동작 처리 (HTML 링크 방식)
     if "del_task" in st.query_params:
         try:
-            st.session_state.schedule_list.pop(int(st.query_params["del_task"]))
-            save_data(SCHEDULE_FILE, st.session_state.schedule_list)
-        except:
+            del_idx = int(st.query_params["del_task"])
+            if 0 <= del_idx < len(st.session_state.schedule_list):
+                st.session_state.schedule_list.pop(del_idx)
+                save_data(SCHEDULE_FILE, st.session_state.schedule_list)
+        except Exception:
             pass
         st.query_params.clear()
         st.rerun()
         
     if "del_leave" in st.query_params:
         try:
-            st.session_state.leave_list.pop(int(st.query_params["del_leave"]))
-            save_data(LEAVE_FILE, st.session_state.leave_list)
-        except:
+            del_idx = int(st.query_params["del_leave"])
+            if 0 <= del_idx < len(st.session_state.leave_list):
+                st.session_state.leave_list.pop(del_idx)
+                save_data(LEAVE_FILE, st.session_state.leave_list)
+        except Exception:
             pass
         st.query_params.clear()
         st.rerun()
 
-    # 1. 📅 준엔지니어링 스케줄 관리 카드 (기간 선택형)
-    st.markdown('<div style="background: rgba(255, 255, 255, 0.95); border-radius: 20px; padding: 20px; margin-bottom: 20px; box-shadow: 0 12px 30px rgba(7, 89, 133, 0.25); backdrop-filter: blur(10px); border: 2px solid #bae6fd;"><h3 style="color: #0284c7; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">📅 준엔지니어링 스케줄 관리</h3>', unsafe_allow_html=True)
+    # 1. 📅 준엔지니어링 스케줄 관리 카드
+    st.markdown('<div class="ocean-card"><h3 style="color: #0284c7; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">📅 준엔지니어링 스케줄 관리</h3>', unsafe_allow_html=True)
     
-    # 날짜 범위 선택 (튜플 형태로 반환됨: (시작일, 종료일) 혹은 단일 선택 시 처리)
     task_dates = st.date_input("스케줄 날짜 기간 선택", value=(datetime.date.today(), datetime.date.today()), key="task_date_range")
     new_task = st.text_input("일정 내용 입력", placeholder="예: 북구 하수관로 조사", key="task_input_box")
 
     if st.button("스케줄 추가", key="btn_add_task", use_container_width=True):
         if new_task.strip():
-            # 날짜 범위가 정상적으로 지정되었는지 확인
             if isinstance(task_dates, tuple) and len(task_dates) == 2:
                 start_d, end_d = task_dates
                 if start_d and end_d:
@@ -388,7 +504,6 @@ with col3:
 
             entry = {"date": date_str, "content": new_task.strip()}
             st.session_state.schedule_list.append(entry)
-            # 날짜순 정렬
             st.session_state.schedule_list = sorted(st.session_state.schedule_list, key=lambda x: x["date"])
             save_data(SCHEDULE_FILE, st.session_state.schedule_list)
             st.rerun()
@@ -400,7 +515,6 @@ with col3:
         task_html = '<div style="font-size:13px; color:#64748b; text-align: center; padding: 10px;">등록된 일정이 없습니다.</div>'
     else:
         for idx, item in enumerate(st.session_state.schedule_list):
-            # 딕셔너리 구조(기간+내용)인지 문자열 형태인지 호환 처리
             if isinstance(item, dict):
                 d_part = item.get("date", "")
                 c_part = item.get("content", "")
@@ -413,9 +527,8 @@ with col3:
     st.markdown(f'<div style="background: #ffffff; border-radius: 12px; border: 1px solid #cbd5e1; padding: 4px 12px; max-height: 250px; overflow-y: auto;">{task_html}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-
-    # 2. 🏖️ 인원 연차 사용 현황 카드 (기간 선택형)
-    st.markdown('<div style="background: rgba(255, 255, 255, 0.95); border-radius: 20px; padding: 20px; margin-bottom: 20px; box-shadow: 0 12px 30px rgba(7, 89, 133, 0.25); backdrop-filter: blur(10px); border: 2px solid #bae6fd;"><h3 style="color: #0d9488 !important; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">🏖️ 인원 연차 사용 현황</h3>', unsafe_allow_html=True)
+    # 2. 🏖️ 인원 연차 사용 현황 카드
+    st.markdown('<div class="ocean-card"><h3 style="color: #0d9488 !important; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">🏖️ 인원 연차 사용 현황</h3>', unsafe_allow_html=True)
     
     leave_dates = st.date_input("연차 날짜 기간 선택", value=(datetime.date.today(), datetime.date.today()), key="leave_date_range")
     new_leave_name = st.text_input("직원 이름 및 내용", placeholder="예: 홍길동 휴가", key="leave_input_box")
@@ -454,4 +567,24 @@ with col3:
             leave_html += f'<div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 8px; border-bottom: 1px solid #f1f5f9;"><span style="font-size: 14px; color: #0f172a; font-weight: 600; word-break: break-all; margin-right: 10px;">• {display_text}</span><a href="?del_leave={idx}" target="_self" style="background: #fee2e2; color: #ef4444; border-radius: 6px; padding: 4px 10px; font-size: 12px; font-weight: bold; text-decoration: none; border: 1px solid #fca5a5; white-space: nowrap;">✕ 삭제</a></div>'
 
     st.markdown(f'<div style="background: #ffffff; border-radius: 12px; border: 1px solid #cbd5e1; padding: 4px 12px; max-height: 250px; overflow-y: auto;">{leave_html}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # 3. 📝 오늘의 메모 카드
+    st.markdown('<div class="ocean-card"><h3 style="color: #0284c7; font-size: 16px; font-weight: 700; border-bottom: 2px dashed #bae6fd; padding-bottom: 8px; margin-top: 0; margin-bottom: 12px;">📝 오늘의 메모 (임시 메모장)</h3>', unsafe_allow_html=True)
+
+    def update_memo():
+        st.session_state.memo_content = st.session_state.memo_text_input
+        save_data(MEMO_FILE, [st.session_state.memo_content])
+
+    st.text_area(
+        "자유롭게 메모하세요",
+        value=st.session_state.memo_content,
+        height=120,
+        placeholder="현장 특이사항, 자재 체크리스트 등을 적어두세요.",
+        key="memo_text_input",
+        on_change=update_memo,
+        label_visibility="collapsed"
+    )
+    
+    st.markdown('<div style="font-size: 11px; color: #64748b; margin-top: 6px; text-align: right;">* 내용 작성 후 바깥을 누르거나 엔터를 치면 자동 저장됩니다.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
